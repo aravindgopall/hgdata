@@ -62,89 +62,96 @@
 --   response <- simpleHttp (\"https://www.googleapis.com/fusiontables/v1/tables?access_token=\"++accessTok)
 --   putStrLn$ BL.unpack response
 -- @
-
 -----------------------------------------------------------------------------
+module Network.Google.OAuth2
+  ( OAuth2Client(..)
+  , OAuth2Scope
+  , OAuth2Tokens(..)
+  , googleScopes
+  , formUrl
+  , exchangeCode
+  , refreshTokens
+  , validateTokens
+  , getCachedTokens
+  ) where
 
-
-module Network.Google.OAuth2 (
 -- * Types
-  OAuth2Client(..)
-, OAuth2Scope
-, OAuth2Tokens(..)
 -- * Functions
-, googleScopes
-, formUrl
-, exchangeCode
-, refreshTokens
-, validateTokens
-, getCachedTokens
-) where
-
-
-import Control.Monad  (unless)
+import Control.Monad (unless)
 import Data.ByteString.Char8 as BS8 (ByteString, pack)
 import Data.ByteString.Lazy.UTF8 (toString)
 import Data.Default (def)
 import Data.List (intercalate)
-import Data.Time.Clock       (getCurrentTime)
+import Data.Time.Clock (getCurrentTime)
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Word (Word64)
 import Network.Google (makeHeaderName)
 import Network.HTTP.Base (urlEncode)
-import Network.HTTP.Conduit (Request(..), RequestBody(..), Response(..), defaultRequest, httpLbs, responseBody, withManager)
-import Text.JSON (JSObject, JSValue(JSRational), Result(Ok), decode, valFromObj)
-import System.Info    (os)
+import Network.HTTP.Client.Conduit (defaultManagerSettings, withManager)
+import Network.HTTP.Conduit
+  ( Request(..)
+  , RequestBody(..)
+  , Response(..)
+  , defaultRequest
+  , httpLbs
+  , responseBody
+  )
+import System.Directory
+  ( createDirectory
+  , doesDirectoryExist
+  , doesFileExist
+  , getAppUserDataDirectory
+  , removeFile
+  , renameFile
+  )
+import System.Exit (ExitCode(..))
+import System.FilePath ((<.>), (</>), splitExtension)
+import System.Info (os)
 import System.Process (rawSystem)
-import System.Exit    (ExitCode(..))
-import System.Directory (doesFileExist, doesDirectoryExist, getAppUserDataDirectory,
-                         createDirectory, renameFile, removeFile)
-import System.FilePath ((</>),(<.>), splitExtension)
 import System.Random (randomIO)
-
+import Text.JSON (JSObject, JSValue(JSRational), Result(Ok), decode, valFromObj)
 
 -- An OAuth 2.0 client for an installed application, see <https://developers.google.com/accounts/docs/OAuth2InstalledApp>.
-data OAuth2Client = OAuth2Client
-  {
-    clientId :: String      -- ^ The client ID.
-  , clientSecret :: String  -- ^ The client secret.
-  }
-    deriving (Read, Show)
-
+data OAuth2Client =
+  OAuth2Client
+    { clientId :: String -- ^ The client ID.
+    , clientSecret :: String -- ^ The client secret.
+    }
+  deriving (Read, Show)
 
 -- | An OAuth 2.0 code.
 type OAuth2Code = String
 
-
 -- | OAuth 2.0 tokens.
-data OAuth2Tokens = OAuth2Tokens
-  {
-    accessToken :: String   -- ^ The access token.
-  , refreshToken :: String  -- ^ The refresh token.
-  , expiresIn :: Rational   -- ^ The number of seconds until the access token expires.
-  , tokenType :: String     -- ^ The token type.
-  }
-    deriving (Read, Show)
-
+data OAuth2Tokens =
+  OAuth2Tokens
+    { accessToken :: String -- ^ The access token.
+    , refreshToken :: String -- ^ The refresh token.
+    , expiresIn :: Rational -- ^ The number of seconds until the access token expires.
+    , tokenType :: String -- ^ The token type.
+    }
+  deriving (Read, Show)
 
 -- | An OAuth 2.0 scope.
 type OAuth2Scope = String
 
-
 -- | The OAuth 2.0 scopes for Google APIs, see <https://developers.google.com/oauthplayground/>.
 googleScopes ::
-  [(String, OAuth2Scope)]  -- ^ List of names and the corresponding scopes.
+     [(String, OAuth2Scope)] -- ^ List of names and the corresponding scopes.
 googleScopes =
-  [
-    ("Adsense Management", "https://www.googleapis.com/auth/adsense")
+  [ ("Adsense Management", "https://www.googleapis.com/auth/adsense")
   , ("Google Affiliate Network", "https://www.googleapis.com/auth/gan")
   , ("Analytics", "https://www.googleapis.com/auth/analytics.readonly")
   , ("Google Books", "https://www.googleapis.com/auth/books")
   , ("Blogger", "https://www.googleapis.com/auth/blogger")
   , ("Calendar", "https://www.googleapis.com/auth/calendar")
-  , ("Google Cloud Storage", "https://www.googleapis.com/auth/devstorage.read_write")
+  , ( "Google Cloud Storage"
+    , "https://www.googleapis.com/auth/devstorage.read_write")
   , ("Contacts", "https://www.google.com/m8/feeds/")
-  , ("Content API for Shopping", "https://www.googleapis.com/auth/structuredcontent")
-  , ("Chrome Web Store", "https://www.googleapis.com/auth/chromewebstore.readonly")
+  , ( "Content API for Shopping"
+    , "https://www.googleapis.com/auth/structuredcontent")
+  , ( "Chrome Web Store"
+    , "https://www.googleapis.com/auth/chromewebstore.readonly")
   , ("Fusion Tables", "https://www.googleapis.com/auth/fusiontables")
   , ("Documents List", "https://docs.google.com/feeds/")
   , ("Google Drive", "https://www.googleapis.com/auth/drive")
@@ -152,7 +159,8 @@ googleScopes =
   , ("Gmail", "https://mail.google.com/mail/feed/atom")
   , ("Google+", "https://www.googleapis.com/auth/plus.me")
   , ("Groups Provisioning", "https://apps-apis.google.com/a/feeds/groups/")
-  , ("Google Latitude", "https://www.googleapis.com/auth/latitude.all.best https://www.googleapis.com/auth/latitude.all.city")
+  , ( "Google Latitude"
+    , "https://www.googleapis.com/auth/latitude.all.best https://www.googleapis.com/auth/latitude.all.city")
   , ("Moderator", "https://www.googleapis.com/auth/moderator")
   , ("Nicknames", "Provisioning https://apps-apis.google.com/a/feeds/alias/")
   , ("Orkut", "https://www.googleapis.com/auth/orkut")
@@ -168,130 +176,119 @@ googleScopes =
   , ("YouTube", "https://gdata.youtube.com")
   ]
 
-
 -- | The redirect URI for an installed application, see <https://developers.google.com/accounts/docs/OAuth2InstalledApp#choosingredirecturi>.
 redirectUri :: String
 redirectUri = "urn:ietf:wg:oauth:2.0:oob"
 
-
 -- | Form a URL for authorizing an installed application, see <https://developers.google.com/accounts/docs/OAuth2InstalledApp#formingtheurl>.
 formUrl ::
-     OAuth2Client   -- ^ The OAuth 2.0 client.
-  -> [OAuth2Scope]  -- ^ The OAuth 2.0 scopes to be authorized.
-  -> String         -- ^ The URL for authorization.
+     OAuth2Client -- ^ The OAuth 2.0 client.
+  -> [OAuth2Scope] -- ^ The OAuth 2.0 scopes to be authorized.
+  -> String -- ^ The URL for authorization.
 formUrl client scopes =
-  "https://accounts.google.com/o/oauth2/auth"
-    ++ "?response_type=code"
-    ++ "&client_id=" ++ clientId client
-    ++ "&redirect_uri=" ++ redirectUri
-    ++ "&scope=" ++ intercalate "+" (map urlEncode scopes)
-
+  "https://accounts.google.com/o/oauth2/auth" ++
+  "?response_type=code" ++
+  "&client_id=" ++
+  clientId client ++
+  "&redirect_uri=" ++
+  redirectUri ++ "&scope=" ++ intercalate "+" (map urlEncode scopes)
 
 -- | Exchange an authorization code for tokens, see <https://developers.google.com/accounts/docs/OAuth2InstalledApp#handlingtheresponse>.
 exchangeCode ::
-     OAuth2Client     -- ^ The OAuth 2.0 client.
-  -> OAuth2Code       -- ^ The authorization code.
-  -> IO OAuth2Tokens  -- ^ The action for obtaining the tokens.
-exchangeCode client code =
-  do
-    result <- doOAuth2 client "authorization_code" ("&redirect_uri=" ++ redirectUri ++ "&code=" ++ code)
-    let
-      (Ok result') = decodeTokens Nothing result
-    return result'
-
+     OAuth2Client -- ^ The OAuth 2.0 client.
+  -> OAuth2Code -- ^ The authorization code.
+  -> IO OAuth2Tokens -- ^ The action for obtaining the tokens.
+exchangeCode client code = do
+  result <-
+    doOAuth2
+      client
+      "authorization_code"
+      ("&redirect_uri=" ++ redirectUri ++ "&code=" ++ code)
+  let (Ok result') = decodeTokens Nothing result
+  return result'
 
 -- | Refresh OAuth 2.0 tokens from JSON data.
 decodeTokens ::
-     Maybe OAuth2Tokens   -- ^ The original tokens, if any.
-  -> JSObject JSValue     -- ^ The JSON value.
-  -> Result OAuth2Tokens  -- ^ The refreshed tokens.
-decodeTokens tokens value =
-  do
-    let
-      (!) = flip valFromObj
+     Maybe OAuth2Tokens -- ^ The original tokens, if any.
+  -> JSObject JSValue -- ^ The JSON value.
+  -> Result OAuth2Tokens -- ^ The refreshed tokens.
+decodeTokens tokens value = do
+  let (!) = flip valFromObj
       -- TODO: There should be a more straightforward way to do this.
       expiresIn' :: Rational
       (Ok (JSRational _ expiresIn')) = valFromObj "expires_in" value
-    accessToken <- value ! "access_token"
-    refreshToken <- maybe (value ! "refresh_token") (Ok . refreshToken) tokens
-    tokenType <- value ! "token_type"
-    return OAuth2Tokens
-      {
-        accessToken = accessToken
+  accessToken <- value ! "access_token"
+  refreshToken <- maybe (value ! "refresh_token") (Ok . refreshToken) tokens
+  tokenType <- value ! "token_type"
+  return
+    OAuth2Tokens
+      { accessToken = accessToken
       , refreshToken = refreshToken
       , expiresIn = expiresIn'
       , tokenType = tokenType
       }
 
-
 -- | Refresh OAuth 2.0 tokens, see <https://developers.google.com/accounts/docs/OAuth2InstalledApp#refresh>.
 refreshTokens ::
-     OAuth2Client     -- ^ The client.
-  -> OAuth2Tokens     -- ^ The tokens.
-  -> IO OAuth2Tokens  -- ^ The action to refresh the tokens.
-refreshTokens client tokens =
-  do
-    result <- doOAuth2 client "refresh_token" ("&refresh_token=" ++ refreshToken tokens)
-    let
-      (Ok result') = decodeTokens (Just tokens) result
-    return result'
-
+     OAuth2Client -- ^ The client.
+  -> OAuth2Tokens -- ^ The tokens.
+  -> IO OAuth2Tokens -- ^ The action to refresh the tokens.
+refreshTokens client tokens = do
+  result <-
+    doOAuth2 client "refresh_token" ("&refresh_token=" ++ refreshToken tokens)
+  let (Ok result') = decodeTokens (Just tokens) result
+  return result'
 
 -- | Peform OAuth 2.0 authentication, see <https://developers.google.com/accounts/docs/OAuth2InstalledApp#handlingtheresponse>.
 doOAuth2 ::
-     OAuth2Client           -- ^ The client.
-  -> String                 -- ^ The grant type.
-  -> String                 -- ^ The
-  -> IO (JSObject JSValue)  -- ^ The action returing the JSON response from making the request.
-doOAuth2 client grantType extraBody =
-  do
-    let
+     OAuth2Client -- ^ The client.
+  -> String -- ^ The grant type.
+  -> String -- ^ The
+  -> IO (JSObject JSValue) -- ^ The action returing the JSON response from making the request.
+doOAuth2 client grantType extraBody
       -- TODO: In principle, we should UTF-8 encode the bytestrings packed below.
-      request =
-        defaultRequest {
-          method = BS8.pack "POST"
-        , secure = True
-        , host = BS8.pack "accounts.google.com"
-        , port = 443
-        , path = BS8.pack "/o/oauth2/token"
-        , requestHeaders = [
-            (makeHeaderName "Content-Type",  BS8.pack "application/x-www-form-urlencoded")
-          ]
-        , requestBody = RequestBodyBS . BS8.pack
-            $ "client_id=" ++ clientId client
-            ++ "&client_secret=" ++ clientSecret client
-            ++ "&grant_type=" ++ grantType
-            ++ extraBody
-        }
-    response <- withManager $ httpLbs request
-    let
-      (Ok result) = decode . toString $ responseBody response
-    return result
-
+ = do
+  let request =
+        defaultRequest
+          { method = BS8.pack "POST"
+          , secure = True
+          , host = BS8.pack "accounts.google.com"
+          , port = 443
+          , path = BS8.pack "/o/oauth2/token"
+          , requestHeaders =
+              [ ( makeHeaderName "Content-Type"
+                , BS8.pack "application/x-www-form-urlencoded")
+              ]
+          , requestBody =
+              RequestBodyBS . BS8.pack $
+              "client_id=" ++
+              clientId client ++
+              "&client_secret=" ++
+              clientSecret client ++ "&grant_type=" ++ grantType ++ extraBody
+          }
+  response <- withManager defaultManagerSettings $ httpLbs request
+  let (Ok result) = decode . toString $ responseBody response
+  return result
 
 -- | Validate OAuth 2.0 tokens, see <https://developers.google.com/accounts/docs/OAuth2Login#validatingtoken>.
 validateTokens ::
-     OAuth2Tokens  -- ^ The tokens.
-  -> IO Rational   -- ^ The number of seconds until the access token expires.
-validateTokens tokens =
-  do
-    let
-      request =
-        defaultRequest {
-          method = BS8.pack "GET"
-        , secure = True
-        , host = BS8.pack "www.googleapis.com"
-        , port = 443
-        , path = BS8.pack "/oauth2/v1/tokeninfo"
-        , queryString = BS8.pack ("?access_token=" ++ accessToken tokens)
-        }
-    response <- withManager $ httpLbs request
-    let
-      (Ok result) = decode . toString $ responseBody response
+     OAuth2Tokens -- ^ The tokens.
+  -> IO Rational -- ^ The number of seconds until the access token expires.
+validateTokens tokens = do
+  let request =
+        defaultRequest
+          { method = BS8.pack "GET"
+          , secure = True
+          , host = BS8.pack "www.googleapis.com"
+          , port = 443
+          , path = BS8.pack "/oauth2/v1/tokeninfo"
+          , queryString = BS8.pack ("?access_token=" ++ accessToken tokens)
+          }
+  response <- withManager defaultManagerSettings $ httpLbs request
+  let (Ok result) = decode . toString $ responseBody response
       expiresIn' :: Rational
       (Ok (JSRational _ expiresIn')) = valFromObj "expires_in" result
-    return expiresIn'
-
+  return expiresIn'
 
 -- | Provide a hassle-free way to retrieve and refresh tokens from a user's home
 -- directory, OR ask the user for permission.
@@ -304,80 +301,85 @@ validateTokens tokens =
 -- procedure will skip the refresh step.  Whether or not it refreshes should be
 -- immaterial to the clients subsequent actions, because all clients should handle
 -- authentication errors (and all 5xx errors) and call `refreshToken` as necessary.
-getCachedTokens :: OAuth2Client -- ^ The client is the \"key\" for token lookup.
-                -> IO OAuth2Tokens
+getCachedTokens ::
+     OAuth2Client -- ^ The client is the \"key\" for token lookup.
+  -> IO OAuth2Tokens
 getCachedTokens client = do
-   cabalD <- getAppUserDataDirectory "cabal"
-   let tokenD = cabalD </> "googleAuthTokens"
-       tokenF = tokenD </> clientId client <.> "token"
-   d1       <- doesDirectoryExist cabalD
-   unless d1 $ createDirectory cabalD -- Race.
-   d2       <- doesDirectoryExist tokenD
-   unless d2 $ createDirectory tokenD -- Race.
-   f1       <- doesFileExist tokenF
-   if f1 then do
+  cabalD <- getAppUserDataDirectory "cabal"
+  let tokenD = cabalD </> "googleAuthTokens"
+      tokenF = tokenD </> clientId client <.> "token"
+  d1 <- doesDirectoryExist cabalD
+  unless d1 $ createDirectory cabalD -- Race.
+  d2 <- doesDirectoryExist tokenD
+  unless d2 $ createDirectory tokenD -- Race.
+  f1 <- doesFileExist tokenF
+  if f1
+    then do
       str <- readFile tokenF
-      case reads str of
+      case reads str
         -- Here's our approach to versioning!  If we can't read it, we remove it.
-        ((oldtime,toks),_):_ -> do
-          tagged <- checkExpiry tokenF (oldtime,toks)
+            of
+        ((oldtime, toks), _):_ -> do
+          tagged <- checkExpiry tokenF (oldtime, toks)
           return (snd tagged)
         [] -> do
-          putStrLn$" [getCachedTokens] Could not read tokens from file: "++ tokenF
-          putStrLn$" [getCachedTokens] Removing tokens and re-authenticating..."
+          putStrLn $
+            " [getCachedTokens] Could not read tokens from file: " ++ tokenF
+          putStrLn $
+            " [getCachedTokens] Removing tokens and re-authenticating..."
           removeFile tokenF
           getCachedTokens client
     else do
-     toks <- askUser
-     fmap snd$ timeStampAndWrite tokenF toks
- where
+      toks <- askUser
+      fmap snd $ timeStampAndWrite tokenF toks
    -- Tokens store a relative time, which is rather silly (relative to what?).  This
    -- routine tags a token with the time it was issued, so as to enable figuring out
    -- the absolute expiration time.  Also, as a side effect, this is where we refresh
    -- the token if it is already expired or expiring soon.
-   checkExpiry :: FilePath -> (Rational, OAuth2Tokens) -> IO (Rational, OAuth2Tokens)
-   checkExpiry tokenF orig@(start1,toks1) = do
-     t <- getCurrentTime
-     let nowsecs = toRational (utcTimeToPOSIXSeconds t)
-         expire1 = start1 + expiresIn toks1
-         tolerance = 15 * 60 -- Skip refresh if token is good for at least 15 min.
-     if expire1 < tolerance + nowsecs then do
-       toks2 <- refreshTokens client toks1
-       timeStampAndWrite tokenF toks2
-      else return orig
-
-   timeStampAndWrite :: FilePath -> OAuth2Tokens -> IO (Rational, OAuth2Tokens)
-   timeStampAndWrite tokenF toks = do
-       t2 <- getCurrentTime
-       let tagged = (toRational (utcTimeToPOSIXSeconds t2), toks)
-       atomicWriteFile tokenF (show tagged)
-       return tagged
-
+  where
+    checkExpiry ::
+         FilePath -> (Rational, OAuth2Tokens) -> IO (Rational, OAuth2Tokens)
+    checkExpiry tokenF orig@(start1, toks1) = do
+      t <- getCurrentTime
+      let nowsecs = toRational (utcTimeToPOSIXSeconds t)
+          expire1 = start1 + expiresIn toks1
+          tolerance = 15 * 60 -- Skip refresh if token is good for at least 15 min.
+      if expire1 < tolerance + nowsecs
+        then do
+          toks2 <- refreshTokens client toks1
+          timeStampAndWrite tokenF toks2
+        else return orig
+    timeStampAndWrite :: FilePath -> OAuth2Tokens -> IO (Rational, OAuth2Tokens)
+    timeStampAndWrite tokenF toks = do
+      t2 <- getCurrentTime
+      let tagged = (toRational (utcTimeToPOSIXSeconds t2), toks)
+      atomicWriteFile tokenF (show tagged)
+      return tagged
    -- This is the part where we require user interaction:
-   askUser = do
-     putStrLn$ " [getCachedTokens] Load this URL: "++show permissionUrl
+    askUser = do
+      putStrLn $ " [getCachedTokens] Load this URL: " ++ show permissionUrl
      -- BJS: This crash on my machine.
      -- runBrowser
-     putStrLn " [getCachedTokens] Then please paste the verification code and press enter:\n$ "
-     authcode <- getLine
-     tokens   <- exchangeCode client authcode
-     putStrLn$ " [getCachedTokens] Received access token: "++show (accessToken tokens)
-     return tokens
-
-   permissionUrl = formUrl client ["https://www.googleapis.com/auth/fusiontables"]
-
+      putStrLn
+        " [getCachedTokens] Then please paste the verification code and press enter:\n$ "
+      authcode <- getLine
+      tokens <- exchangeCode client authcode
+      putStrLn $
+        " [getCachedTokens] Received access token: " ++
+        show (accessToken tokens)
+      return tokens
+    permissionUrl =
+      formUrl client ["https://www.googleapis.com/auth/fusiontables"]
    -- This is hackish and incomplete
-   runBrowser =
+    runBrowser =
       case os of
-        "linux"  -> rawSystem "gnome-open" [permissionUrl]
-        "darwin" -> rawSystem "open"       [permissionUrl]
-        _        -> return ExitSuccess
-
-   atomicWriteFile file str = do
-     suff <- randomIO :: IO Word64
-     let (root,ext) = splitExtension file
-         tmp = root ++ show suff <.> ext
-     writeFile tmp str
+        "linux" -> rawSystem "gnome-open" [permissionUrl]
+        "darwin" -> rawSystem "open" [permissionUrl]
+        _ -> return ExitSuccess
+    atomicWriteFile file str = do
+      suff <- randomIO :: IO Word64
+      let (root, ext) = splitExtension file
+          tmp = root ++ show suff <.> ext
+      writeFile tmp str
      -- RenameFile makes this atomic:
-     renameFile tmp file
-
+      renameFile tmp file
